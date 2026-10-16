@@ -1866,6 +1866,7 @@ func (r *WorkflowReconciler) updateStatusFromJobs(ctx context.Context, workflow 
 	// those into whatever the API server holds, so a group this pass did not
 	// touch is never overwritten from a cached view that may be behind.
 	changed := map[string]bool{}
+	observedAttempts := map[string]nvcrev1alpha1.GroupStatus{}
 	markChanged := func(g *nvcrev1alpha1.GroupStatus) {
 		statusChanged = true
 		changed[g.Name] = true
@@ -1890,6 +1891,7 @@ func (r *WorkflowReconciler) updateStatusFromJobs(ctx context.Context, workflow 
 		if g.Phase != nvcrev1alpha1.GroupRunning || g.JobRef == nil {
 			continue
 		}
+		observed := *g.DeepCopy()
 		outcome, blocked, err := r.observeRunningGroup(ctx, workflow, orch, g)
 		if err != nil {
 			if _, denied := errors.AsType[*accessDeniedWriteError](err); denied {
@@ -1909,6 +1911,7 @@ func (r *WorkflowReconciler) updateStatusFromJobs(ctx context.Context, workflow 
 			}
 		case groupChanged:
 			markChanged(g)
+			observedAttempts[g.Name] = observed
 		case groupViewStale:
 			stale = true
 		}
@@ -1939,10 +1942,13 @@ func (r *WorkflowReconciler) updateStatusFromJobs(ctx context.Context, workflow 
 		// fail it.
 		want := make([]nvcrev1alpha1.GroupStatus, len(orch.Groups))
 		copy(want, orch.Groups)
+		firstApply := true
 		applyGroups := func(w *nvcrev1alpha1.Workflow) bool {
 			if w.Status.Orchestration == nil || !statusChanged {
 				return false
 			}
+			initialApply := firstApply
+			firstApply = false
 			applied := false
 			for i := range w.Status.Orchestration.Groups {
 				name := w.Status.Orchestration.Groups[i].Name
@@ -1951,8 +1957,15 @@ func (r *WorkflowReconciler) updateStatusFromJobs(ctx context.Context, workflow 
 				}
 				for j := range want {
 					if want[j].Name == name {
-						w.Status.Orchestration.Groups[i] = want[j]
-						applied = true
+						expected, ok := observedAttempts[name]
+						if initialApply {
+							w.Status.Orchestration.Groups[i] = want[j]
+							applied = true
+						} else if !ok || !mergeObservedGroupStatus(w, orch.CurrentIteration, expected, want[j]) {
+							stale = true
+						} else {
+							applied = true
+						}
 						break
 					}
 				}
@@ -1973,7 +1986,7 @@ func (r *WorkflowReconciler) updateStatusFromJobs(ctx context.Context, workflow 
 		// pointed the Workflow at them. Carry those refs like the groups, so a
 		// conflict refetch or the reload above does not drop them while the
 		// ConfigMap they name survives. A denied write never sets a ref.
-		if err := r.setWorkflowInProgress(ctx, statusTarget, reason, msg, applyGroups,
+		if err := r.setWorkflowInProgressPreservingFailure(ctx, statusTarget, reason, msg, applyGroups,
 			applySucceededNodesRef(workflow.Status.SucceededNodesRef),
 			applyFailedNodesRef(workflow.Status.FailedNodesRef),
 			removeDependencyRefs(droppedDependencyRefs(refsBefore, workflow.Status.DependencyRefs))); err != nil {
@@ -2003,6 +2016,31 @@ const (
 	// server; leave it alone this pass and requeue immediately.
 	groupViewStale
 )
+
+func mergeObservedGroupStatus(
+	w *nvcrev1alpha1.Workflow,
+	iteration int,
+	expected, observed nvcrev1alpha1.GroupStatus,
+) bool {
+	if w.Status.Orchestration == nil || w.Status.Orchestration.CurrentIteration != iteration ||
+		expected.JobRef == nil || observed.Name != expected.Name {
+		return false
+	}
+	for i := range w.Status.Orchestration.Groups {
+		live := &w.Status.Orchestration.Groups[i]
+		if live.Name != expected.Name {
+			continue
+		}
+		if live.Phase != expected.Phase || live.Retries != expected.Retries || live.JobRef == nil ||
+			live.JobRef.APIVersion != expected.JobRef.APIVersion || live.JobRef.Kind != expected.JobRef.Kind ||
+			live.JobRef.Name != expected.JobRef.Name || live.JobRef.Namespace != expected.JobRef.Namespace {
+			return false
+		}
+		*live = *observed.DeepCopy()
+		return true
+	}
+	return false
+}
 
 // observeRunningGroup reconciles one Running group against its Job and reports
 // what happened to it. blocked carries the Job's scheduling-blocked diagnosis
@@ -3317,6 +3355,66 @@ func collectAllDomainNodes(groups []nvcrev1alpha1.GroupStatus) map[string][]stri
 // setWorkflowInProgress sets the Workflow to InProgress state.
 func (r *WorkflowReconciler) setWorkflowInProgress(ctx context.Context, workflow *nvcrev1alpha1.Workflow, reason, message string, extra ...func(*nvcrev1alpha1.Workflow) bool) error {
 	return r.setExclusiveCondition(ctx, workflow, nvcrev1alpha1.WorkflowInProgress, reason, message, extra...)
+}
+
+// setWorkflowInProgressPreservingFailure applies observed group updates without
+// replacing a terminal failure that another reconcile persisted concurrently.
+func (r *WorkflowReconciler) setWorkflowInProgressPreservingFailure(
+	ctx context.Context,
+	workflow *nvcrev1alpha1.Workflow,
+	reason, message string,
+	extra ...func(*nvcrev1alpha1.Workflow) bool,
+) error {
+	conditionTypes := []string{
+		nvcrev1alpha1.WorkflowInProgress,
+		nvcrev1alpha1.WorkflowSucceeded,
+		nvcrev1alpha1.WorkflowFailed,
+	}
+	var wrote bool
+	var transition *conditionTransition
+	err := updateStatusWithRetry(ctx, r.Client, workflow, func(w *nvcrev1alpha1.Workflow) bool {
+		wrote = false
+		transition = nil
+		before := append([]metav1.Condition(nil), w.Status.Conditions...)
+		changed := false
+		for _, apply := range extra {
+			if apply != nil && apply(w) {
+				changed = true
+			}
+		}
+		if !CondIsTrue(w.Status.Conditions, nvcrev1alpha1.WorkflowFailed) &&
+			applyExclusiveConditions(&w.Status.Conditions, conditionTypes,
+				nvcrev1alpha1.WorkflowInProgress, reason, message, w.Generation) {
+			changed = true
+		}
+		wrote = changed
+		if !changed {
+			return false
+		}
+		previousTrue := trueConditionType(before, conditionTypes)
+		newTrue := trueConditionType(w.Status.Conditions, conditionTypes)
+		if previousTrue != newTrue && newTrue != "" {
+			condition := meta.FindStatusCondition(w.Status.Conditions, newTrue)
+			transition = &conditionTransition{
+				PreviousTrueType: previousTrue,
+				NewTrueType:      newTrue,
+				Condition:        *condition,
+			}
+		}
+		return true
+	})
+	if err != nil {
+		return fmt.Errorf("failed to update %T status: %w", workflow, err)
+	}
+	if transition != nil {
+		r.eventf(workflow,
+			transitionEventType(transition.NewTrueType, nvcrev1alpha1.WorkflowFailed),
+			transition.Condition.Reason, "%s", transition.Condition.Message)
+	}
+	if wrote && !CondIsTrue(workflow.Status.Conditions, nvcrev1alpha1.WorkflowFailed) {
+		logf.FromContext(ctx).Info("Workflow status updated", "status", nvcrev1alpha1.WorkflowInProgress, "reason", reason)
+	}
+	return nil
 }
 
 // setWorkflowSucceeded sets the Workflow to Succeeded state.
